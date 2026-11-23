@@ -124,9 +124,14 @@ class DeliveryItemInput(StrictModel):
     table_name: str = Field(min_length=1, max_length=128)
     row_no: int = Field(ge=1, le=2_000_000_000)
     merged_student_no: str | None = Field(default=None, max_length=128)
+    # Registration rows may be addressed by the version of the registration
+    # form they came from.  Omitted, the row number is taken as the original
+    # registered source row number.
+    version: str | None = Field(default=None, max_length=128)
 
     _strip_table = field_validator("table_name")(_strip_required)
     _strip_merged = field_validator("merged_student_no")(_strip_optional)
+    _strip_version = field_validator("version")(_strip_optional)
 
 
 class DeliveryRequest(StrictModel):
@@ -144,7 +149,13 @@ class DeliveryRequest(StrictModel):
                             "merged_student_no": "S001",
                         },
                     ],
-                }
+                },
+                {
+                    "request_id": "demo-delivery-v2",
+                    "items": [
+                        {"table_name": "registration", "row_no": 21, "version": "v2026-2"},
+                    ],
+                },
             ]
         },
     )
@@ -178,6 +189,70 @@ class DeliveryOut(BaseModel):
 class DeliveryListResponse(BaseModel):
     total: int
     items: list[DeliveryOut]
+
+
+# ---------------------------------------------------------------------------
+# Registration version switches
+# ---------------------------------------------------------------------------
+
+class VersionRowMappingInput(StrictModel):
+    """One line of a version switch: old row number -> new row number."""
+
+    old_row_no: int = Field(ge=1, le=2_000_000_000)
+    new_row_no: int = Field(ge=1, le=2_000_000_000)
+
+
+class VersionSwitchRequest(StrictModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "examples": [
+                {
+                    "current_version": "v2026-1",
+                    "new_version": "v2026-2",
+                    "mappings": [
+                        {"old_row_no": 1, "new_row_no": 11},
+                        {"old_row_no": 2, "new_row_no": 12},
+                        {"old_row_no": 3, "new_row_no": 13},
+                    ],
+                }
+            ]
+        },
+    )
+
+    current_version: str = Field(min_length=1, max_length=128)
+    new_version: str = Field(min_length=1, max_length=128)
+    mappings: list[VersionRowMappingInput] = Field(min_length=1, max_length=100000)
+
+    _strip_current = field_validator("current_version")(_strip_required)
+    _strip_new = field_validator("new_version")(_strip_required)
+
+    @model_validator(mode="after")
+    def _distinct_versions(self) -> "VersionSwitchRequest":
+        if self.current_version == self.new_version:
+            raise ValueError("new_version must differ from current_version")
+        return self
+
+
+class VersionRowMappingOut(BaseModel):
+    old_row_no: int
+    new_row_no: int
+    source_row_no: int
+
+
+class VersionSwitchOut(BaseModel):
+    version_no: str
+    from_version: str
+    is_active: bool
+    row_count: int
+    created_at: str
+    mappings: list[VersionRowMappingOut]
+
+
+class VersionListResponse(BaseModel):
+    total: int
+    active_version: str | None
+    items: list[VersionSwitchOut]
 
 
 # ---------------------------------------------------------------------------

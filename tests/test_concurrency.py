@@ -216,3 +216,166 @@ def test_failed_split_rolls_back_counters_and_student_numbers(tmp_path):
         assert sheet["line_count"] == 1
     finally:
         conn.close()
+
+
+def test_parallel_version_switches_only_one_succeeds(tmp_path):
+    db_path = str(tmp_path / "version-race.db")
+    init_db(db_path)
+    setup = connect(db_path)
+    try:
+        service.upsert_source_rows(
+            setup,
+            [
+                {"table_name": "registration", "row_no": 1, "merged_student_no": "R1"},
+                {"table_name": "registration", "row_no": 2, "merged_student_no": "R2"},
+                {"table_name": "registration", "row_no": 3, "merged_student_no": "R3"},
+            ],
+        )
+    finally:
+        setup.close()
+
+    results: list[dict] = []
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(6)
+
+    def worker(index: int) -> None:
+        conn = connect(db_path)
+        try:
+            barrier.wait(timeout=10)
+            # Every worker believes v1 is current and publishes its own new
+            # version.  Only one may win; the others must see the active row
+            # move underneath them.
+            result = service.switch_registration_version(
+                conn,
+                current_version="v1",
+                new_version=f"v2-worker-{index}",
+                mappings=[
+                    {"old_row_no": 1, "new_row_no": 10 + index},
+                    {"old_row_no": 2, "new_row_no": 20 + index},
+                    {"old_row_no": 3, "new_row_no": 30 + index},
+                ],
+            )
+            results.append(result)
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            conn.close()
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert len(results) == 1, errors
+    assert len(errors) == 5
+    assert all(
+        getattr(exc, "code", None) == "version_not_active" for exc in errors
+    ), errors
+
+    conn = connect(db_path)
+    try:
+        versions = conn.execute(
+            "SELECT version_no, is_active, row_count FROM registration_versions"
+        ).fetchall()
+        assert len(versions) == 1
+        assert versions[0]["is_active"] == 1
+        assert versions[0]["row_count"] == 3
+        active_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM registration_versions WHERE is_active = 1"
+        ).fetchone()["n"]
+        assert active_count == 1
+        mapping_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM registration_version_rows"
+        ).fetchone()["n"]
+        assert mapping_count == 3
+    finally:
+        conn.close()
+
+
+def test_version_switch_and_delivery_concurrently_stay_consistent(tmp_path):
+    db_path = str(tmp_path / "version-delivery-race.db")
+    init_db(db_path)
+    setup = connect(db_path)
+    try:
+        service.upsert_source_rows(
+            setup,
+            [
+                {"table_name": "registration", "row_no": 1, "merged_student_no": "R1"},
+                {"table_name": "registration", "row_no": 2, "merged_student_no": "R2"},
+            ],
+        )
+        project_id = service.create_project(setup, "并发换版课题组")["project_id"]
+    finally:
+        setup.close()
+
+    barrier = threading.Barrier(2)
+    switch_error: list[BaseException] = []
+    delivery_error: list[BaseException] = []
+
+    def switch_worker() -> None:
+        conn = connect(db_path)
+        try:
+            barrier.wait(timeout=10)
+            service.switch_registration_version(
+                conn,
+                current_version="v1",
+                new_version="v2",
+                mappings=[
+                    {"old_row_no": 1, "new_row_no": 2},
+                    {"old_row_no": 2, "new_row_no": 1},
+                ],
+            )
+        except Exception as exc:  # pragma: no cover - asserted below
+            switch_error.append(exc)
+        finally:
+            conn.close()
+
+    def delivery_worker() -> None:
+        conn = connect(db_path)
+        try:
+            barrier.wait(timeout=10)
+            service.deliver(
+                conn,
+                project_id,
+                [{"table_name": "registration", "row_no": 1}],
+                request_id="concurrent-delivery",
+            )
+        except Exception as exc:  # pragma: no cover - asserted below
+            delivery_error.append(exc)
+        finally:
+            conn.close()
+
+    threads = [
+        threading.Thread(target=switch_worker),
+        threading.Thread(target=delivery_worker),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert not switch_error, switch_error
+    assert not delivery_error, delivery_error
+
+    conn = connect(db_path)
+    try:
+        # The versioned row resolves to the same source row and therefore the
+        # same stable project row number as the unversioned delivery.
+        versioned = service.deliver(
+            conn,
+            project_id,
+            [{"table_name": "registration", "row_no": 2, "version": "v2"}],
+            request_id="after-race",
+        )
+        rows = conn.execute(
+            "SELECT project_row_no FROM project_rows WHERE project_id = ?",
+            (project_id,),
+        ).fetchall()
+        # Only source row 1 was ever delivered; the versioned line resolves
+        # back to it instead of creating a second project row.
+        assert len(rows) == 1
+        assert versioned["items"][0]["project_row_no"] == 1
+        assert versioned["new_project_row_count"] == 0
+    finally:
+        conn.close()

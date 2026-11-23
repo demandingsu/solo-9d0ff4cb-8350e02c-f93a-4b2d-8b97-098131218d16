@@ -18,6 +18,12 @@ Numbering rules
 * A correction line stores the original anonymous project row number and the
   new student number, so a correction sheet is an immutable record and can be
   fetched verbatim later.
+* Registration version switches are append-only.  Each published version keeps
+  an old-row -> new-row mapping that also records the original source row
+  number, so a versioned delivery line is resolved to its source row before any
+  project numbering happens.  The same source row therefore keeps the same
+  project row/student numbers across every version, and row numbers may be
+  reused between versions.
 
 Every mutation runs inside ``BEGIN IMMEDIATE``: a failure rolls back the
 reassignment, the split record and any correction lines together.
@@ -164,6 +170,264 @@ def _validate_unique_rows(rows: list[dict[str, Any]]) -> None:
             "同一批次中出现了重复的表名与行号",
             {"duplicates": duplicates},
         )
+
+
+# ---------------------------------------------------------------------------
+# Registration versioning
+# ---------------------------------------------------------------------------
+
+REGISTRATION_TABLE = "registration"
+
+
+def _active_version_row(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM registration_versions WHERE is_active = 1"
+    ).fetchone()
+
+
+def _get_version_row(
+    conn: sqlite3.Connection, version_no: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM registration_versions WHERE version_no = ?",
+        (version_no,),
+    ).fetchone()
+
+
+def _version_mappings(
+    conn: sqlite3.Connection, version_no: str
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT old_row_no, new_row_no, source_row_no
+        FROM registration_version_rows
+        WHERE version_no = ?
+        ORDER BY ordinal
+        """,
+        (version_no,),
+    ).fetchall()
+
+
+def switch_registration_version(
+    conn: sqlite3.Connection,
+    current_version: str,
+    new_version: str,
+    mappings: list[dict[str, Any]],
+) -> dict[str, Any]:
+    with write_tx(conn):
+        return switch_registration_version_tx(
+            conn, current_version, new_version, mappings
+        )
+
+
+def switch_registration_version_tx(
+    conn: sqlite3.Connection,
+    current_version: str,
+    new_version: str,
+    mappings: list[dict[str, Any]],
+) -> dict[str, Any]:
+    # Version numbers can never be reused, even when the rest of the request
+    # is stale or invalid.
+    if _get_version_row(conn, new_version) is not None:
+        raise ApiError(
+            409,
+            "version_no_reused",
+            "新版号已存在，版号不得复用",
+            {"new_version": new_version},
+        )
+
+    # Both columns of the mapping must be unique on their own.
+    old_seen: set[int] = set()
+    new_seen: set[int] = set()
+    duplicate_old: list[int] = []
+    duplicate_new: list[int] = []
+    for mapping in mappings:
+        old_no = int(mapping["old_row_no"])
+        new_no = int(mapping["new_row_no"])
+        if old_no in old_seen:
+            duplicate_old.append(old_no)
+        if new_no in new_seen:
+            duplicate_new.append(new_no)
+        old_seen.add(old_no)
+        new_seen.add(new_no)
+    if duplicate_old or duplicate_new:
+        raise ApiError(
+            422,
+            "duplicate_version_row_no",
+            "对照中的旧行号或新行号必须各自唯一",
+            {"duplicate_old_row_nos": duplicate_old,
+             "duplicate_new_row_nos": duplicate_new},
+        )
+
+    active = _active_version_row(conn)
+    if active is None:
+        # First switch: every currently registered registration row must be
+        # covered by the mapping, and old row numbers must match the rows in
+        # the source table at this moment.
+        if _get_version_row(conn, current_version) is not None:
+            raise ApiError(
+                409,
+                "version_not_active",
+                "当前版号已被换下，不能再次换版",
+                {"current_version": current_version, "active_version": None},
+            )
+        registered = conn.execute(
+            "SELECT row_no FROM source_rows WHERE table_name = ? ORDER BY row_no",
+            (REGISTRATION_TABLE,),
+        ).fetchall()
+        registered_nos = {int(r["row_no"]) for r in registered}
+        if registered_nos != old_seen:
+            raise ApiError(
+                422,
+                "version_mapping_incomplete",
+                "首次换版的对照必须覆盖库中全部报名行",
+                {"missing_old_row_nos": sorted(registered_nos - old_seen),
+                 "unknown_old_row_nos": sorted(old_seen - registered_nos)},
+            )
+        # On the first switch the source row number is the old row number.
+        source_by_new = {int(m["new_row_no"]): int(m["old_row_no"])
+                         for m in mappings}
+        from_version = current_version
+    else:
+        active_version = active["version_no"]
+        if active_version != current_version:
+            raise ApiError(
+                409,
+                "version_not_active",
+                "当前版号已被换下，不能再次换版",
+                {"current_version": current_version,
+                 "active_version": active_version},
+            )
+        current_rows = _version_mappings(conn, active_version)
+        current_new_nos = {int(r["new_row_no"]) for r in current_rows}
+        if current_new_nos != old_seen:
+            raise ApiError(
+                422,
+                "version_mapping_incomplete",
+                "对照必须覆盖当前版的全部行",
+                {"missing_old_row_nos": sorted(current_new_nos - old_seen),
+                 "unknown_old_row_nos": sorted(old_seen - current_new_nos)},
+            )
+        # Trace every new row number back to the original registered source
+        # row through the current version's mapping.
+        source_by_current_new = {
+            int(r["new_row_no"]): int(r["source_row_no"]) for r in current_rows
+        }
+        source_by_new = {
+            int(m["new_row_no"]): source_by_current_new[int(m["old_row_no"])]
+            for m in mappings
+        }
+        from_version = active_version
+
+    now = utcnow()
+    if active is not None:
+        conn.execute(
+            "UPDATE registration_versions SET is_active = 0 WHERE version_no = ?",
+            (active["version_no"],),
+        )
+    cursor = conn.execute(
+        """
+        INSERT INTO registration_versions
+            (version_no, from_version, is_active, row_count, created_at)
+        VALUES (?, ?, 1, ?, ?)
+        """,
+        (new_version, from_version, len(mappings), now),
+    )
+    version_id = int(cursor.lastrowid)
+    for ordinal, mapping in enumerate(mappings, start=1):
+        old_no = int(mapping["old_row_no"])
+        new_no = int(mapping["new_row_no"])
+        conn.execute(
+            """
+            INSERT INTO registration_version_rows
+                (version_no, old_row_no, new_row_no, source_row_no,
+                 ordinal, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (new_version, old_no, new_no, source_by_new[new_no], ordinal, now),
+        )
+    return _version_switch_response(conn, version_id)
+
+
+def _version_switch_response(
+    conn: sqlite3.Connection, version_id: int
+) -> dict[str, Any]:
+    version = conn.execute(
+        "SELECT * FROM registration_versions WHERE version_id = ?",
+        (version_id,),
+    ).fetchone()
+    if version is None:
+        raise ApiError(404, "version_not_found", "报名版号不存在")
+    rows = _version_mappings(conn, version["version_no"])
+    return {
+        "version_no": version["version_no"],
+        "from_version": version["from_version"],
+        "is_active": bool(version["is_active"]),
+        "row_count": int(version["row_count"]),
+        "created_at": version["created_at"],
+        "mappings": [
+            {
+                "old_row_no": int(r["old_row_no"]),
+                "new_row_no": int(r["new_row_no"]),
+                "source_row_no": int(r["source_row_no"]),
+            }
+            for r in rows
+        ],
+    }
+
+
+def list_registration_versions(conn: sqlite3.Connection) -> dict[str, Any]:
+    versions = conn.execute(
+        "SELECT version_id FROM registration_versions ORDER BY version_id"
+    ).fetchall()
+    active = _active_version_row(conn)
+    return {
+        "total": len(versions),
+        "active_version": active["version_no"] if active is not None else None,
+        "items": [
+            _version_switch_response(conn, int(r["version_id"])) for r in versions
+        ],
+    }
+
+
+def _resolve_registration_item(
+    conn: sqlite3.Connection, item: dict[str, Any]
+) -> tuple[int, str | None]:
+    """Resolve a delivery line to its original registered source row number.
+
+    A registration line without ``version`` is taken at its original row
+    number (this also covers rows registered after the latest switch).  A
+    versioned line walks the published mapping of that version.  The active
+    version keeps serving rows after it has been superseded: every published
+    mapping is immutable.
+    """
+    version_no = item.get("version")
+    row_no = int(item["row_no"])
+    if version_no is None:
+        return row_no, None
+    version = _get_version_row(conn, version_no)
+    if version is None:
+        raise ApiError(
+            404,
+            "unknown_version",
+            "交付明细引用了未知的报名版号",
+            {"version": version_no},
+        )
+    mapping = conn.execute(
+        """
+        SELECT source_row_no FROM registration_version_rows
+        WHERE version_no = ? AND new_row_no = ?
+        """,
+        (version_no, row_no),
+    ).fetchone()
+    if mapping is None:
+        raise ApiError(
+            404,
+            "unknown_version_row",
+            "交付明细的行号在该报名版号中不存在",
+            {"version": version_no, "row_no": row_no},
+        )
+    return int(mapping["source_row_no"]), version_no
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +655,40 @@ def deliver_tx(
 ) -> dict[str, Any]:
     require_project(conn, project_id)
 
+    # Resolve versioned registration lines to their original source rows.
+    # A line without a version keeps its row number as the source row number,
+    # which also covers registration rows added after the latest switch.
+    resolved_items: list[dict[str, Any]] = []
+    for item in items:
+        if item.get("version") and item["table_name"] != REGISTRATION_TABLE:
+            raise ApiError(
+                422,
+                "version_only_for_registration",
+                "版号只能用于 registration 表的交付明细",
+                {"table_name": item["table_name"], "version": item["version"]},
+            )
+        if item["table_name"] == REGISTRATION_TABLE and item.get("version"):
+            source_row_no, version_no = _resolve_registration_item(conn, item)
+            resolved_items.append(
+                {
+                    "table_name": REGISTRATION_TABLE,
+                    "row_no": source_row_no,
+                    "merged_student_no": item.get("merged_student_no"),
+                    "version": version_no,
+                    "submitted_row_no": int(item["row_no"]),
+                }
+            )
+        else:
+            resolved_items.append(
+                {
+                    "table_name": item["table_name"],
+                    "row_no": int(item["row_no"]),
+                    "merged_student_no": item.get("merged_student_no"),
+                    "version": item.get("version"),
+                    "submitted_row_no": int(item["row_no"]),
+                }
+            )
+
     signature = fingerprint(
         {
             "items": [
@@ -398,6 +696,7 @@ def deliver_tx(
                     "table_name": item["table_name"],
                     "row_no": int(item["row_no"]),
                     "merged_student_no": item.get("merged_student_no"),
+                    "version": item.get("version"),
                 }
                 for item in items
             ]
@@ -419,13 +718,15 @@ def deliver_tx(
                 )
             return _delivery_response(conn, int(existing["delivery_id"]))
 
-    # Validate the whole batch before writing anything.
-    _validate_unique_rows(items)
+    # Validate the whole batch before writing anything.  Dedup is on the
+    # resolved source coordinates, so two versions of the same registration
+    # row inside one batch are rejected as duplicates.
+    _validate_unique_rows(resolved_items)
 
     sources: dict[tuple[str, int], sqlite3.Row] = {}
     missing: list[dict[str, Any]] = []
     mismatches: list[dict[str, Any]] = []
-    for item in items:
+    for item in resolved_items:
         key = (item["table_name"], int(item["row_no"]))
         source = conn.execute(
             "SELECT * FROM source_rows WHERE table_name = ? AND row_no = ?", key
@@ -472,7 +773,7 @@ def deliver_tx(
     delivery_id = int(cursor.lastrowid)
 
     new_project_row_count = 0
-    for ordinal, item in enumerate(items, start=1):
+    for ordinal, item in enumerate(resolved_items, start=1):
         table_name = item["table_name"]
         row_no = int(item["row_no"])
         source = sources[(table_name, row_no)]

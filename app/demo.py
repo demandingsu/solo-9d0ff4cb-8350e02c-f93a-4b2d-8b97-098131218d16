@@ -9,7 +9,12 @@ The scenario is designed so that it exercises every rule in one run:
   correction sheet contains the interspersed deliveries while the later
   delivery uses the new student number;
 * a second split (``S003``) only touches a row that was never delivered, so it
-  must produce an empty correction sheet.
+  must produce an empty correction sheet;
+* the registration form is re-paginated twice: ``v2026-1`` -> ``v2026-2``
+  swaps rows 1 and 2, then ``v2026-2`` -> ``v2026-3`` renumbers every row.
+  A versioned delivery proves the swapped rows keep their original project
+  numbers, and a row registered only afterwards is delivered without a
+  version.
 
 Seeding is idempotent: it returns the project it created on the first call.
 """
@@ -37,6 +42,12 @@ SOURCE_ROWS: list[dict[str, Any]] = [
     # S004: delivered but never split.
     {"table_name": "registration", "row_no": 4, "merged_student_no": "S004"},
     {"table_name": "assessment", "row_no": 14, "merged_student_no": "S004"},
+]
+
+# Registered only after the first version switch below.  Rows added later can
+# still be delivered by their original row number without a version.
+LATE_SOURCE_ROWS: list[dict[str, Any]] = [
+    {"table_name": "registration", "row_no": 5, "merged_student_no": "S005"},
 ]
 
 
@@ -113,10 +124,61 @@ def seed_demo(conn: sqlite3.Connection) -> dict[str, Any]:
             ],
             request_id="demo-split-2",
         )
+        # 6. First registration version switch.  The training team re-paginated
+        #    the form; rows 1 and 2 swap places, rows 3/4 keep their numbers.
+        #    The first switch is anchored to the rows registered at the time.
+        switch_v2 = service.switch_registration_version_tx(
+            conn,
+            current_version="v2026-1",
+            new_version="v2026-2",
+            mappings=[
+                {"old_row_no": 1, "new_row_no": 2},
+                {"old_row_no": 2, "new_row_no": 1},
+                {"old_row_no": 3, "new_row_no": 3},
+                {"old_row_no": 4, "new_row_no": 4},
+            ],
+        )
+        # 7. Deliver against the new version: v2026-2 row 2 is the same source
+        #    row as the old registration row 1, so it keeps project row number 1.
+        versioned_delivery = service.deliver_tx(
+            conn,
+            project_id,
+            [
+                {"table_name": "registration", "row_no": 2, "version": "v2026-2"},
+                {"table_name": "registration", "row_no": 1, "version": "v2026-2"},
+            ],
+            request_id="demo-delivery-v2",
+        )
+        # 8. A second switch to show chains and row-number reuse: v3 numbers
+        #    rows in yet another order; published v2 mappings stay available.
+        service.switch_registration_version_tx(
+            conn,
+            current_version="v2026-2",
+            new_version="v2026-3",
+            mappings=[
+                {"old_row_no": 1, "new_row_no": 31},
+                {"old_row_no": 2, "new_row_no": 32},
+                {"old_row_no": 3, "new_row_no": 33},
+                {"old_row_no": 4, "new_row_no": 34},
+            ],
+        )
+        # 9. A new registration row is registered only after the switch.  It
+        #    has no mapping in any published version, so it is delivered
+        #    without a version and resolves to its original row number.
+        service.upsert_source_rows_tx(conn, LATE_SOURCE_ROWS)
+        late_delivery = service.deliver_tx(
+            conn,
+            project_id,
+            [{"table_name": "registration", "row_no": 5}],
+            request_id="demo-delivery-late",
+        )
 
         summary = _summary(conn, project_id)
         summary["first_delivery_id"] = first["delivery_id"]
         summary["first_split_id"] = split["split_id"]
+        summary["version_switch_id"] = switch_v2["version_no"]
+        summary["versioned_delivery_id"] = versioned_delivery["delivery_id"]
+        summary["late_delivery_id"] = late_delivery["delivery_id"]
     return {
         "project_id": project_id,
         "seeded": True,
@@ -134,7 +196,10 @@ def _summary(conn: sqlite3.Connection, project_id: str) -> dict[str, Any]:
         "delivery_items": "SELECT COUNT(*) AS n FROM delivery_items WHERE project_id = ?",
         "splits": "SELECT COUNT(*) AS n FROM splits WHERE project_id = ?",
         "correction_lines": "SELECT COUNT(*) AS n FROM correction_items WHERE project_id = ?",
+        "registration_versions": "SELECT COUNT(*) AS n FROM registration_versions",
+        "version_mappings": "SELECT COUNT(*) AS n FROM registration_version_rows",
     }.items():
-        params = () if key == "source_rows" else (project_id,)
+        global_tables = {"source_rows", "registration_versions", "version_mappings"}
+        params = () if key in global_tables else (project_id,)
         counts[key] = int(conn.execute(sql, params).fetchone()["n"])
     return counts

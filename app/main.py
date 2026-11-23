@@ -34,6 +34,9 @@ from .models import (
     SplitListResponse,
     SplitOut,
     SplitRequest,
+    VersionListResponse,
+    VersionSwitchOut,
+    VersionSwitchRequest,
 )
 
 log = logging.getLogger("supply_correction")
@@ -54,10 +57,13 @@ app = FastAPI(
     version=__version__,
     description=(
         "培训报名表与测评表按课题分批交付，使用课题专用匿名行号和学员号；"
-        "支持误并学员的拆分，并按成功登记的交付记录出具可重复获取的更正单。\n\n"
-        "演示：先 `POST /demo/seed` 生成一套包含跨表关联、交错交付与拆分的"
-        "数据，再用 `GET /projects/{project_id}/rows` 和 "
-        "`GET /projects/{project_id}/corrections` 查看编号与更正单。"
+        "支持误并学员的拆分，并按成功登记的交付记录出具可重复获取的更正单。"
+        "报名表重新排版时可通过 `/registration/versions/switch` 换版，"
+        "交付明细带版号即按已发布对照回溯到原始报名行。\n\n"
+        "演示：先 `POST /demo/seed` 生成一套包含跨表关联、交错交付、拆分和"
+        "报名行号互换换版的数据，再用 `GET /projects/{project_id}/rows`、"
+        "`GET /projects/{project_id}/corrections` 和 "
+        "`GET /registration/versions` 查看编号、更正单与版号对照。"
     ),
     lifespan=lifespan,
     openapi_tags=[
@@ -65,6 +71,7 @@ app = FastAPI(
         {"name": "source", "description": "源明细：表名 + 行号 + 归并学员号"},
         {"name": "projects", "description": "课题组"},
         {"name": "delivery", "description": "按课题交付与课题内匿名编号"},
+        {"name": "registration", "description": "报名表换版与行号对照"},
         {"name": "split", "description": "误并学员拆分"},
         {"name": "corrections", "description": "更正单"},
         {"name": "demo", "description": "演示数据"},
@@ -174,6 +181,39 @@ def list_source_rows(
 ):
     with read_tx(conn):
         return service.list_source_rows(conn, limit, offset, table_name)
+
+
+# ---------------------------------------------------------------------------
+# Registration versioning
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/registration/versions/switch",
+    response_model=VersionSwitchOut,
+    status_code=201,
+    tags=["registration"],
+    summary="报名表换版：提交当前版号、新版号与旧行号到新行号的对照",
+    responses={404: {"model": ErrorEnvelope}, 409: {"model": ErrorEnvelope},
+               422: {"model": ErrorEnvelope}},
+)
+def switch_registration_version(payload: VersionSwitchRequest, conn: Conn):
+    return service.switch_registration_version(
+        conn,
+        payload.current_version,
+        payload.new_version,
+        [mapping.model_dump() for mapping in payload.mappings],
+    )
+
+
+@app.get(
+    "/registration/versions",
+    response_model=VersionListResponse,
+    tags=["registration"],
+    summary="列出已发布的报名版号对照（含当前生效版号）",
+)
+def list_registration_versions(conn: Conn):
+    with read_tx(conn):
+        return service.list_registration_versions(conn)
 
 
 # ---------------------------------------------------------------------------

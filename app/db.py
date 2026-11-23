@@ -20,6 +20,12 @@ Key modelling decisions
   student number for a moved row.  Lines are written in the same transaction as
   the split, keyed by the *original anonymous row number* and the new student
   number, so a correction sheet is immutable and can be re-fetched verbatim.
+* ``registration_versions`` / ``registration_version_rows`` keep the append-only
+  history of registration form re-pagination.  A partial unique index allows
+  exactly one active version, version numbers are globally unique, and every
+  published mapping stores the trace from its new row number back to the
+  original registered source row.  Versioned delivery lines resolve through
+  these mappings before they touch the project numbering tables.
 """
 
 from __future__ import annotations
@@ -175,6 +181,39 @@ CREATE TABLE IF NOT EXISTS correction_items (
     recorded_at      TEXT NOT NULL,
     UNIQUE (split_id, delivery_item_id)
 );
+
+-- Registration table versioning.  The training team may re-paginate the
+-- registration form; every accepted switch stays here forever and a version
+-- number can never be reused.  Exactly one row is the active version.
+CREATE TABLE IF NOT EXISTS registration_versions (
+    version_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    version_no     TEXT NOT NULL UNIQUE,
+    from_version   TEXT NOT NULL,
+    is_active      INTEGER NOT NULL CHECK (is_active IN (0, 1)),
+    row_count      INTEGER NOT NULL,
+    created_at     TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_registration_versions_active
+    ON registration_versions(is_active) WHERE is_active = 1;
+
+-- Immutable mapping of one switch: old row number -> new row number.  Both
+-- columns are unique inside a switch, and a row number may be reused across
+-- different versions.
+CREATE TABLE IF NOT EXISTS registration_version_rows (
+    version_row_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    version_no      TEXT NOT NULL REFERENCES registration_versions(version_no),
+    old_row_no      INTEGER NOT NULL,
+    new_row_no      INTEGER NOT NULL,
+    source_row_no   INTEGER NOT NULL,
+    ordinal         INTEGER NOT NULL,
+    created_at      TEXT NOT NULL,
+    UNIQUE (version_no, old_row_no),
+    UNIQUE (version_no, new_row_no)
+);
+
+CREATE INDEX IF NOT EXISTS ix_registration_version_rows_source
+    ON registration_version_rows(version_no, source_row_no);
 
 CREATE INDEX IF NOT EXISTS ix_project_rows_student
     ON project_rows(project_id, current_student_no);
